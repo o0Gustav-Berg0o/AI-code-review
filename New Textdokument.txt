@@ -1,0 +1,195 @@
+# Diff-tjänst för AI-kodgranskning (Azure Function + DiffPlex)
+ 
+Liten Azure Function som tar BEFORE och AFTER för en fil och returnerar bara de ändrade avsnitten som en unified diff med några rader kontext. Används av Power Automate-flödet för AI-kodgranskning av Azure DevOps-PR:er.
+ 
+## Bakgrund
+ 
+Flödet skickar idag hela filer (BEFORE och AFTER) till AI-granskningen. Det ger tre problem:
+ 
+- Underlaget blir stort (testet på PR 318 gav 299 423 tecken och kapades vid gränsen).
+- Azure DevOps tillåter högst 150 000 tecken i en PR-kommentar, vilket slår mot fallback-kommentaren när AI-credits är slut.
+- Kostnaden i AI-credits följer antal tokens, och samma kod skickas två gånger (BEFORE och AFTER).
+Azure DevOps-connectorn i Power Automate och REST-dokumentationen saknar en färdig diff med hunkar, så diffen måste räknas ut av en egen tjänst.
+ 
+## Arkitektur
+ 
+```mermaid
+flowchart LR
+    A[Power Automate: For Each Changed File] -->|BEFORE + AFTER| B[Azure Function /diff]
+    B -->|unified diff| A
+    A --> C[ReviewInput]
+    C --> D[AI Builder-prompt]
+    C --> E[Fallback-kommentar i PR]
+```
+ 
+Tjänsten är tillståndslös och lagrar ingenting.
+ 
+## API-kontrakt
+ 
+`POST /api/diff` (auktoriseringsnivå: Function key, header `x-functions-key`)
+ 
+Request:
+ 
+```json
+{ "before": "<text eller tom>", "after": "<text eller tom>", "context": 8 }
+```
+ 
+Response:
+ 
+```json
+{ "diff": "@@ -12,9 +12,9 @@\n ...", "changedLines": 4, "skipped": false, "reason": null }
+```
+ 
+| Fält | Beskrivning |
+|---|---|
+| `diff` | Unified diff. Tom sträng om inget skiljer. |
+| `changedLines` | Antal `+`- och `-`-rader. |
+| `skipped` | `true` om filen inte diffades (binär eller för stor). |
+| `reason` | Kort orsak när `skipped` är `true`. |
+ 
+## Krav på beteende
+ 
+- Normalisera radbrytningar (CRLF och LF) före jämförelsen. Annars blir alla rader ändrade i filer med blandade radslut.
+- Standardkontext är 8 rader. `context` i requesten får åsidosätta (gräns 0-50).
+- Hunkar som ligger närmare varandra än två gånger kontexten slås ihop.
+- Ny fil: `before` är tom, alla rader blir `+`. Borttagen fil: `after` är tom, alla rader blir `-`.
+- Identiska filer (eller bara skillnad i radslut) ger tom `diff` så att flödet kan hoppa över filen.
+- Binärfiler (null-tecken i texten) och filer över gränsen (förslag 500 000 tecken) returnerar `skipped: true`, inte ett fel.
+- Svarskod: `200` normalt, `400` vid ogiltig JSON, `401` vid fel nyckel (hanteras av Functions).
+## Projektstruktur (förslag)
+ 
+```
+/src
+  DiffService.Function/
+    Program.cs
+    DiffFunction.cs
+    UnifiedDiffBuilder.cs
+  DiffService.Tests/
+    UnifiedDiffBuilderTests.cs
+    DiffFunctionTests.cs
+README.md
+```
+ 
+Målramverk och Functions-version väljs enligt teamets standard. Verifiera att vald .NET-version stöds av Azure Functions (isolated worker) innan ni bygger.
+ 
+## Implementation
+ 
+### 1. Skapa projektet
+ 
+- Azure Functions, .NET isolated worker, HTTP-trigger, ASP.NET Core-integration (`ConfigureFunctionsWebApplication`).
+- NuGet: `DiffPlex`.
+- Kontrollera i DiffPlex-dokumentationen om versionen har en färdig unified diff-renderare. Om den har det, använd den i stället för egen hunk-logik. Paketnamn och signatur är inte verifierade här.
+### 2. Skiss av funktionen
+ 
+Skissen är ett utgångsläge, inte färdig kod. `UnifiedDiffBuilder.Build` ska implementeras enligt kraven ovan.
+ 
+```csharp
+public record DiffRequest(string? Before, string? After, int? Context);
+public record DiffResponse(string Diff, int ChangedLines, bool Skipped, string? Reason);
+ 
+public class DiffFunction(ILogger<DiffFunction> logger)
+{
+    private const int MaxChars = 500_000;
+    private const int DefaultContext = 8;
+ 
+    [Function("Diff")]
+    public async Task<IActionResult> Run(
+        [HttpTrigger(AuthorizationLevel.Function, "post", Route = "diff")] HttpRequest req)
+    {
+        DiffRequest? input;
+        try { input = await req.ReadFromJsonAsync<DiffRequest>(); }
+        catch (JsonException) { return new BadRequestObjectResult("Invalid JSON"); }
+ 
+        var before = Normalize(input?.Before);
+        var after = Normalize(input?.After);
+        var context = Math.Clamp(input?.Context ?? DefaultContext, 0, 50);
+ 
+        if (before.Contains('\0') || after.Contains('\0'))
+            return new OkObjectResult(new DiffResponse("", 0, true, "binary"));
+        if (before.Length > MaxChars || after.Length > MaxChars)
+            return new OkObjectResult(new DiffResponse("", 0, true, "too large"));
+ 
+        var (diff, changed) = UnifiedDiffBuilder.Build(before, after, context);
+ 
+        // Logga aldrig innehåll, bara storlekar.
+        logger.LogInformation("Diff built. BeforeLen={B} AfterLen={A} Changed={C}",
+            before.Length, after.Length, changed);
+ 
+        return new OkObjectResult(new DiffResponse(diff, changed, false, null));
+    }
+ 
+    private static string Normalize(string? s) => (s ?? "").Replace("\r\n", "\n");
+}
+```
+ 
+### 3. Hunk-logik
+ 
+Kraven finns under "Krav på beteende". Bygg den som en ren, testbar klass utan beroenden till Functions. Jämför alltid resultatet mot `git diff -U8` på riktiga filer.
+ 
+## Ändringar i Power Automate-flödet
+ 
+I **For Each Changed File**, efter stegen som hämtar BEFORE och AFTER:
+ 
+1. Lägg till en HTTP-åtgärd mot funktionen. Bygg bodyn med `setProperty` så att citattecken och radbrytningar escapas:
+```
+   setProperty(setProperty(json('{"context":8}'), 'before', <BEFORE-text>), 'after', <AFTER-text>)
+```
+ 
+   Sätt header `x-functions-key` från en miljövariabel av typen secret.
+2. Lägg till retry-policy (exponentiell) på HTTP-åtgärden.
+3. Om `diff` är tom eller `skipped` är `true`: hoppa över filen (eller lägg bara filnamn och orsak i underlaget).
+4. Bygg `ReviewInput` i formatet:
+ 
+```
+   === FILE ===
+   Path: <sökväg>
+   ChangeType: <edit/add/delete>
+   === DIFF ===
+   <diff>
+   === END FILE ===
+```
+ 
+Kapningsvillkoret vid 300 000 tecken kan finnas kvar som skyddsnät.
+ 
+## Ändringar i prompten
+ 
+Gäller både AI Builder-prompten och texten i fallbacken (`PromptInstructions`).
+ 
+- Byt beskrivningen av indata till: "Input is unified diffs. Lines starting with `+` were added, `-` were removed, and a space marks unchanged context. Review ONLY added and removed lines. Context lines are for understanding only."
+- Skriv om reglerna 1-4 så att de refererar till `+` och `-` i stället för BEFORE och AFTER.
+- Regel 9: "For a new file all lines are `+`, so treat the whole file as introduced by this pull request."
+## Säkerhet och drift
+ 
+- Kundkod passerar tjänsten. Logga aldrig request- eller response-innehåll, bara filnamn, storlekar och tider. Kontrollera att Application Insights inte sparar bodyn.
+- Function key lagras som secret (helst via Key Vault-referens), inte i klartext i flödet.
+- Kör i samma region och tenant som resten av lösningen.
+- Sätt timeout och retry i flödet. En diff av en vanlig fil bör ta millisekunder.
+- Överväg nätverksbegränsning (IP-begränsning eller privat endpoint) om miljön kräver det.
+## Testplan
+ 
+Enhetstester för `UnifiedDiffBuilder`:
+ 
+- ny fil, borttagen fil, identiska filer
+- bara skillnad i radslut (CRLF mot LF)
+- en ändring mitt i filen, ändring på första och sista raden
+- två ändringar nära varandra (ska slås ihop) och långt ifrån varandra (separata hunkar)
+- tom fil mot tom fil, fil utan avslutande radbrytning
+- stora filer (prestanda) och binärt innehåll
+Integrationstest:
+ 
+- Jämför svaret för två till tre riktiga filer mot `git diff -U8` lokalt.
+- Kör flödet mot PR 318. Underlaget bör bli en bråkdel av tidigare 299 423 tecken.
+- Provoka fallbacken (temporär Terminate i Try-scopet) och kontrollera att kommentaren ryms under 150 000 tecken.
+## Acceptanskriterier
+ 
+- För en typisk PR är underlaget minst 70 % mindre än med hela filer.
+- Diffen är identisk med `git diff -U8` på testfilerna, bortsett från rubrikrader.
+- Inga filinnehåll syns i loggar.
+- Flödet hanterar `skipped` och tom diff utan fel.
+- AI-granskningen ger fortsatt rimliga findings på samma PR jämfört med full-fil-läget.
+## Öppna frågor
+ 
+- Vilken .NET-version och vilket hostingalternativ (Consumption, Flex Consumption eller Premium) ska användas?
+- Har den DiffPlex-version som används en färdig unified diff-renderare?
+- Hur stor kontext ger bäst granskning (3, 8 eller 10 rader)? Utvärdera på några riktiga PR:er.
+- Behövs nätverksbegränsning på funktionen?
