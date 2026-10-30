@@ -20,8 +20,9 @@ public class DiffFunction(ILogger<DiffFunction> logger)
     public async Task<IActionResult> Run(
         [HttpTrigger(AuthorizationLevel.Function, "post", Route = "diff")] HttpRequest req)
     {
+        // Not ReadFromJsonAsync: it throws InvalidOperationException (a 500) when Content-Type is not JSON.
         DiffRequest? input;
-        try { input = await req.ReadFromJsonAsync<DiffRequest>(JsonOptions); }
+        try { input = await JsonSerializer.DeserializeAsync<DiffRequest>(req.Body, JsonOptions); }
         catch (JsonException) { return new BadRequestObjectResult("Invalid JSON"); }
 
         return Handle(input);
@@ -38,7 +39,14 @@ public class DiffFunction(ILogger<DiffFunction> logger)
         if (before.Length > MaxChars || after.Length > MaxChars)
             return new OkObjectResult(new DiffResponse("", 0, true, "too large"));
 
-        var (diff, changed) = UnifiedDiffBuilder.Build(before, after, context);
+        string diff;
+        int changed;
+        try { (diff, changed) = UnifiedDiffBuilder.Build(before, after, context); }
+        catch (DiffTooComplexException)
+        {
+            logger.LogInformation("Diff skipped as too complex. BeforeLen={B} AfterLen={A}", before.Length, after.Length);
+            return new OkObjectResult(new DiffResponse("", 0, true, "too complex"));
+        }
 
         // Logga aldrig innehåll, bara storlekar.
         logger.LogInformation("Diff built. BeforeLen={B} AfterLen={A} Changed={C}",
