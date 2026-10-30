@@ -4,7 +4,7 @@ Azure Function (.NET 8 isolated worker, DiffPlex) som returnerar unified diff f√
 Se "New Textdokument.txt" f√∂r specifikation.
 
     cd src
-    dotnet test
+    dotnet test DiffService.Tests/DiffService.Tests.csproj
     cd DiffService.Function && func start
 
 `POST /api/diff` med `{ "before": "...", "after": "...", "context": 8 }` och header `x-functions-key`.
