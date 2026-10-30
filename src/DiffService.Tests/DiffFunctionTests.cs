@@ -1,4 +1,6 @@
+using System.Text;
 using DiffService.Function;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -56,6 +58,75 @@ public class DiffFunctionTests
         Assert.Equal(2, Call(before, after, 0).Diff.Split('\n').Length - 1);
         // 50 lines of context on each side plus -/+ and the header
         Assert.Equal(1 + 50 + 2 + 50, Call(before, after, 999).Diff.Split('\n').Length);
+    }
+
+    [Fact]
+    public void MixedLineEndings_OnlyRealChangesShowUp()
+    {
+        var r = Call("a\r\nb\nc\r\nd\n", "a\nb\r\nX\nd\r\n", 1);
+        Assert.Equal("@@ -2,3 +2,3 @@\n b\n-c\n+X\n d", r.Diff);
+        Assert.Equal(2, r.ChangedLines);
+    }
+
+    [Fact]
+    public void ExactlyAtSizeLimit_IsNotSkipped()
+    {
+        var r = Call(new string('x', 500_000), "a");
+        Assert.False(r.Skipped);
+        Assert.Equal(2, r.ChangedLines);
+    }
+
+    [Fact]
+    public void RewrittenLargeFile_IsSkippedAsTooComplex()
+    {
+        var before = string.Concat(Enumerable.Range(0, 30_000).Select(n => $"a{n}\n"));
+        var after = string.Concat(Enumerable.Range(0, 30_000).Select(n => $"b{n}\n"));
+        Assert.True(before.Length < 500_000 && after.Length < 500_000);
+
+        var r = Call(before, after);
+        Assert.True(r.Skipped);
+        Assert.Equal("too complex", r.Reason);
+        Assert.Equal("", r.Diff);
+    }
+
+    private static DefaultHttpContext RequestWith(string body, string? contentType)
+    {
+        var ctx = new DefaultHttpContext();
+        ctx.Request.Body = new MemoryStream(Encoding.UTF8.GetBytes(body));
+        ctx.Request.ContentType = contentType;
+        return ctx;
+    }
+
+    [Fact]
+    public async Task Run_ValidJson_ReturnsDiff()
+    {
+        var ctx = RequestWith("""{"before":"a\nb\n","after":"a\nc\n","context":3}""", "application/json");
+        var result = Assert.IsType<OkObjectResult>(await _function.Run(ctx.Request));
+        var response = Assert.IsType<DiffResponse>(result.Value);
+
+        Assert.Equal("@@ -1,2 +1,2 @@\n a\n-b\n+c", response.Diff);
+        Assert.Equal(2, response.ChangedLines);
+    }
+
+    [Theory]
+    [InlineData("not json")]
+    [InlineData("")]
+    [InlineData("""{"before": 123}""")]
+    [InlineData("""{"before": "a",""")]
+    public async Task Run_InvalidJson_Returns400(string body)
+    {
+        var ctx = RequestWith(body, "application/json");
+        Assert.IsType<BadRequestObjectResult>(await _function.Run(ctx.Request));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("text/plain")]
+    public async Task Run_WithoutJsonContentType_StillWorks(string? contentType)
+    {
+        var ctx = RequestWith("""{"before":"a\n","after":"b\n"}""", contentType);
+        var result = Assert.IsType<OkObjectResult>(await _function.Run(ctx.Request));
+        Assert.Equal(2, Assert.IsType<DiffResponse>(result.Value).ChangedLines);
     }
 
     [Fact]

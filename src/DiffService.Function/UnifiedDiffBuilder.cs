@@ -14,6 +14,19 @@ public static class UnifiedDiffBuilder
     private const char NoEolMarker = '\u0001';
     private const string NoEolText = "\\ No newline at end of file";
 
+    // The diff algorithm costs roughly O(lines * edits): a big file with a few edits takes milliseconds,
+    // but a completely rewritten or shuffled one can run for minutes. Two limits keep the worst case bounded.
+
+    /// <summary>Most lines (both sides together, unchanged head and tail excluded) that are handed to the diff algorithm.</summary>
+    public const int MaxDiffLines = 60_000;
+
+    /// <summary>
+    /// Most lines that differ as a multiset (a cheap lower bound on the number of changed lines).
+    /// A change this large is not reviewable anyway.
+    /// </summary>
+    public const int MaxChangedLines = 20_000;
+
+    /// <exception cref="DiffTooComplexException">The files differ too much to diff within a reasonable time.</exception>
     public static (string Diff, int ChangedLines) Build(string before, string after, int context)
     {
         if (before == after) return ("", 0);
@@ -21,9 +34,22 @@ public static class UnifiedDiffBuilder
         var a = SplitLines(before);
         var b = SplitLines(after);
 
+        // Unchanged head and tail never take part in the diff, which makes the common case (a few edits in a big file) cheap.
+        var head = 0;
+        while (head < a.Count && head < b.Count && a[head] == b[head]) head++;
+        var tail = 0;
+        while (tail < a.Count - head && tail < b.Count - head && a[^(tail + 1)] == b[^(tail + 1)]) tail++;
+
+        var midA = a.GetRange(head, a.Count - head - tail);
+        var midB = b.GetRange(head, b.Count - head - tail);
+        if (midA.Count + midB.Count > MaxDiffLines || MultisetDifference(midA, midB) > MaxChangedLines)
+            throw new DiffTooComplexException();
+
         var model = new Differ().CreateCustomDiffs(
-            Join(a), Join(b), ignoreWhiteSpace: false, ignoreCase: false, Chunk);
-        var blocks = model.DiffBlocks;
+            Join(midA), Join(midB), ignoreWhiteSpace: false, ignoreCase: false, Chunk);
+        var blocks = model.DiffBlocks
+            .Select(x => new DiffBlock(x.DeleteStartA + head, x.DeleteCountA, x.InsertStartB + head, x.InsertCountB))
+            .ToList();
         if (blocks.Count == 0) return ("", 0);
 
         var sb = new StringBuilder();
@@ -62,6 +88,15 @@ public static class UnifiedDiffBuilder
         return (sb.ToString().TrimEnd('\n'), changed);
     }
 
+    // Number of lines that cannot be paired with an equal line on the other side, regardless of order.
+    private static int MultisetDifference(List<string> a, List<string> b)
+    {
+        var counts = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var line in a) counts[line] = counts.GetValueOrDefault(line) + 1;
+        foreach (var line in b) counts[line] = counts.GetValueOrDefault(line) - 1;
+        return counts.Values.Sum(Math.Abs);
+    }
+
     private static int Gap(DiffBlock x, DiffBlock y) => y.DeleteStartA - (x.DeleteStartA + x.DeleteCountA);
 
     // Like git: "start,count" with 1-based start, "start" when count is 1, and the preceding line number when count is 0.
@@ -96,3 +131,7 @@ public static class UnifiedDiffBuilder
         return lines;
     }
 }
+
+/// <summary>The files differ too much to diff within a reasonable time.</summary>
+public class DiffTooComplexException()
+    : Exception("The files are too large or differ too much to diff.");

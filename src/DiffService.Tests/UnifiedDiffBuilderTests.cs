@@ -91,6 +91,70 @@ public class UnifiedDiffBuilderTests
     }
 
     [Fact]
+    public void ChangeAtEndOfFile_OnlyShowsContextBefore()
+    {
+        var before = Lines(1, 20);
+        var after = before.Replace("line20\n", "LAST\n");
+        var (diff, changed) = UnifiedDiffBuilder.Build(before, after, 2);
+
+        Assert.Equal(2, changed);
+        Assert.Equal("@@ -18,3 +18,3 @@\n line18\n line19\n-line20\n+LAST", diff);
+    }
+
+    [Fact]
+    public void ChangeAtStartOfFile_OnlyShowsContextAfter()
+    {
+        var before = Lines(1, 20);
+        var after = before.Replace("line1\n", "FIRST\n");
+        var (diff, _) = UnifiedDiffBuilder.Build(before, after, 2);
+
+        Assert.Equal("@@ -1,3 +1,3 @@\n-line1\n+FIRST\n line2\n line3", diff);
+    }
+
+    [Fact]
+    public void InsertionAndDeletion_KeepLineNumbersOnBothSidesInSync()
+    {
+        var before = Lines(1, 30);
+        var after = before.Replace("line5\n", "").Replace("line20\n", "line20\nextra\n");
+        var (diff, changed) = UnifiedDiffBuilder.Build(before, after, 1);
+
+        Assert.Equal(2, changed);
+        Assert.Equal("@@ -4,3 +4,2 @@\n line4\n-line5\n line6\n@@ -20,2 +19,3 @@\n line20\n+extra\n line21", diff);
+    }
+
+    [Fact]
+    public void BigFileWithEditsFarApart_IsNotRejected()
+    {
+        // Two edits at opposite ends: the unchanged region between them is far larger than any "changed lines" limit.
+        var before = Lines(1, 28_000);
+        var after = before.Replace("line5\n", "CHANGED\n").Replace("line27000\n", "CHANGED\n");
+        var (diff, changed) = UnifiedDiffBuilder.Build(before, after, 8);
+
+        Assert.Equal(4, changed);
+        Assert.Equal(2, diff.Split('\n').Count(l => l.StartsWith("@@")));
+    }
+
+    [Fact]
+    public void CompletelyRewrittenFile_ThrowsInsteadOfRunningForMinutes()
+    {
+        var before = string.Concat(Enumerable.Range(0, 30_000).Select(n => $"a{n}\n"));
+        var after = string.Concat(Enumerable.Range(0, 30_000).Select(n => $"b{n}\n"));
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        Assert.Throws<DiffTooComplexException>(() => UnifiedDiffBuilder.Build(before, after, 8));
+        Assert.True(sw.ElapsedMilliseconds < 1000);
+    }
+
+    [Fact]
+    public void FileWithTooManyLines_Throws()
+    {
+        // 250,000 one-character lines fit in the 500,000 character request limit.
+        var before = string.Concat(Enumerable.Repeat("a\n", 250_000));
+        var after = string.Concat(Enumerable.Repeat("b\n", 250_000));
+        Assert.Throws<DiffTooComplexException>(() => UnifiedDiffBuilder.Build(before, after, 8));
+    }
+
+    [Fact]
     public void LargeFile_IsFast()
     {
         var before = Lines(1, 20_000);
